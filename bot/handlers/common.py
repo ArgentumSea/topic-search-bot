@@ -40,7 +40,18 @@ async def _safe_delete(message: Message) -> None:
 
 async def _report_error(message: Message, exc: Exception) -> None:
     if isinstance(exc, QuotaExhaustedError):
-        await message.answer("Лимит API иссяк — попробуйте позже")
+        await message.answer("Все модели временно недоступны: квота дня или перегрузка. Попробуйте через 10-15 минут.")
+        try:
+            from bot.config import settings
+
+            for admin_id in settings.ADMIN_IDS:
+                await message.bot.send_message(
+                    admin_id,
+                    "⚠️ Gemini: лимиты всех моделей иссякли. Бот отвечает"
+                    " пользователям заглушкой, пока квота не восстановится.",
+                )
+        except Exception:  # noqa: BLE001
+            pass
     else:
         await message.answer(f"Ошибка обработки: {exc}")
     log.warning("processing failed", extra={"error": str(exc)})

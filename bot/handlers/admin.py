@@ -9,6 +9,9 @@ from aiogram.types import (
     Message,
 )
 
+from datetime import date
+
+from bot.config import settings
 from bot.db import Database
 
 log = logging.getLogger(__name__)
@@ -35,36 +38,29 @@ def _display_name(row) -> str:
     return f"@{row['username']}" if row["username"] else str(row["tg_id"])
 
 
-async def _build_user_list(
-    db: Database, actor
-) -> tuple[str, InlineKeyboardMarkup]:
-    rows = await db.list_users()
-    lines, buttons = [], []
-    for r in rows:
-        lines.append(
-            f"{_display_name(r)} — {ROLE_LABEL[r['role']]}"
-            f" — {r['created_at'][:10]}"
-        )
-        if _can_manage(actor["role"], r["role"]):
-            tg = r["tg_id"]
-            row = [
+def _user_card(row) -> tuple[str, InlineKeyboardMarkup]:
+    """Карточка пользователя: текст + его личные кнопки действий."""
+    tg = row["tg_id"]
+    text = (
+        f"{_display_name(row)} — {ROLE_LABEL[row['role']]}"
+        f" — {row['created_at'][:10]}"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
                 InlineKeyboardButton(
-                    text="🔽 разжаловать" if r["role"] == "assistant"
-                    else "🔼 ассистент",
+                    text="🔽 разжаловать" if row["role"] == "assistant" else "🔼 ассистент",
                     callback_data=f"adm:{tg}:toggle_role",
                 ),
                 InlineKeyboardButton(
-                    text="🔓 разблокировать" if r["is_blocked"]
-                    else "🔒 заблокировать",
+                    text="🔓 разблокировать" if row["is_blocked"] else "🔒 заблокировать",
                     callback_data=f"adm:{tg}:toggle_block",
                 ),
-                InlineKeyboardButton(
-                    text="🗑 удалить", callback_data=f"adm:{tg}:delete"
-                ),
+                InlineKeyboardButton(text="🗑 удалить", callback_data=f"adm:{tg}:delete"),
             ]
-            buttons.append(row)
-    text = "Пользователи:\n" + ("\n".join(lines) if lines else "пусто")
-    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+        ]
+    )
+    return text, keyboard
 
 
 @router.message(Command("admin"))
@@ -72,24 +68,24 @@ async def cmd_admin(message: Message, db: Database, db_user) -> None:
     if db_user is None or db_user["role"] not in ("admin", "assistant"):
         await message.answer("Нет доступа к этой команде.")
         return
-    text, keyboard = await _build_user_list(db, db_user)
-    await message.answer(text, reply_markup=keyboard)
+    rows = await db.list_users()
+    lines = [
+        f"{_display_name(r)} — {ROLE_LABEL[r['role']]}" for r in rows
+    ]
+    await message.answer(
+        "Пользователи:\n" + ("\n".join(lines) if lines else "пусто")
+    )
+    for r in rows:
+        if _can_manage(db_user["role"], r["role"]):
+            text, keyboard = _user_card(r)
+            await message.answer(text, reply_markup=keyboard)
 
 
 @router.callback_query(F.data.startswith("adm:"))
 async def admin_action(
     callback: CallbackQuery, db: Database, db_user
 ) -> None:
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer("Некорректные данные")
-        return
-    _, tg_id_str, action = parts
-    try:
-        int(tg_id_str)
-    except ValueError:
-        await callback.answer("Некорректные данные")
-        return
+    _, tg_id_str, action = callback.data.split(":")
     target = await db.get_user_by_tg_id(int(tg_id_str))
     if target is None or target["is_deleted"]:
         await callback.answer("Пользователь не найден")
@@ -111,16 +107,21 @@ async def admin_action(
             return
         await db.soft_delete(target["id"])
         log.info("user deleted", extra={"tg": tg_id_str})
+        await callback.answer("Удалён")
+        await callback.message.delete()
+        return
     else:
         await callback.answer("Неизвестное действие")
         return
 
     await callback.answer("Готово")
-    text, keyboard = await _build_user_list(db, db_user)
-    try:
-        await callback.message.edit_text(text, reply_markup=keyboard)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("cannot refresh admin list", extra={"error": str(exc)})
+    target = await db.get_user_by_tg_id(int(tg_id_str))
+    if target is not None and not target["is_deleted"]:
+        text, keyboard = _user_card(target)
+        if _can_manage(db_user["role"], target["role"]):
+            await callback.message.edit_text(text, reply_markup=keyboard)
+        else:
+            await callback.message.edit_text(text)
 
 
 @router.message(Command("stat"))
@@ -136,6 +137,10 @@ async def cmd_stat(message: Message, db: Database, db_user) -> None:
         f"{_display_name(r)} — {r['requests_today']} — {r['requests_total']}"
         for r in rows
     ]
+    spent, reset = await db.get_tavily_usage()
+    days_left = (reset - date.today()).days
+    header = (f"Tavily: потрачено {spent} из {settings.TAVILY_MONTHLY_BUDGET}\n"
+              f"До обновления {days_left} дней ({reset.strftime('%d.%m.%Y')})\n\n")
     await message.answer(
-        "user — запросов за сутки — за всё время\n\n" + "\n".join(lines)
+        header + "user — запросов за сутки — за всё время\n\n" + "\n".join(lines)
     )

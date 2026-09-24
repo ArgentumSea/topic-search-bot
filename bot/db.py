@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import aiosqlite
 
@@ -46,6 +46,20 @@ CREATE TABLE IF NOT EXISTS posts (
     model_used TEXT,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS kv (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL UNIQUE,
+    title TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    bound INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -60,6 +74,7 @@ class Database:
 
     async def init(self) -> None:
         self._conn = await aiosqlite.connect(self._path)
+        await self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA)
         await self._conn.commit()
@@ -228,6 +243,138 @@ class Database:
         )
         await self._conn.commit()
         return True
+
+    async def _kv_get(self, key: str) -> str | None:
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT value FROM kv WHERE key = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row["value"] if row else None
+
+    async def _kv_set(self, key: str, value: str) -> None:
+        assert self._conn is not None
+        await self._conn.execute(
+            "INSERT INTO kv (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        await self._conn.commit()
+
+    @staticmethod
+    def _next_reset(d: "date", rd: int) -> "date":
+        if d.day < rd:
+            return d.replace(day=rd)
+        m, y = d.month + 1, d.year
+        if m == 13:
+            m, y = 1, y + 1
+        return date(y, m, rd)
+
+    async def get_tavily_usage(self) -> tuple[int, "date"]:
+        """(потрачено кредитов, дата следующего сброса)."""
+        from bot.config import settings
+        today = date.today()
+        start_raw = await self._kv_get("tavily_window_start")
+        if start_raw is None:
+            start = today
+            spent = settings.TAVILY_INITIAL_CREDITS
+        else:
+            start = date.fromisoformat(start_raw)
+            spent = int(await self._kv_get("tavily_credits") or 0)
+        rd = settings.TAVILY_RESET_DAY
+        reset = self._next_reset(start, rd)
+        while today >= reset:
+            start, spent = reset, 0
+            reset = self._next_reset(start, rd)
+        await self._kv_set("tavily_window_start", start.isoformat())
+        await self._kv_set("tavily_credits", str(spent))
+        return spent, reset
+
+    async def add_tavily_spend(self, credits: int) -> None:
+        spent, _ = await self.get_tavily_usage()
+        await self._kv_set("tavily_credits", str(spent + credits))
+
+    async def list_active_tg_ids(self) -> list[int]:
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT tg_id FROM users WHERE is_deleted = 0"
+        ) as cur:
+            return [r["tg_id"] for r in await cur.fetchall()]
+
+    async def cleanup_old_logs(self, days: int = 90) -> int:
+        """Удаляет записи старше N дней. Возвращает число удалённых строк."""
+        assert self._conn is not None
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cur1 = await self._conn.execute(
+            "DELETE FROM requests_log WHERE created_at < ?", (cutoff,)
+        )
+        cur2 = await self._conn.execute(
+            "DELETE FROM posts WHERE created_at < ?", (cutoff,)
+        )
+        await self._conn.commit()
+        return (cur1.rowcount or 0) + (cur2.rowcount or 0)
+
+    async def get_recent_posts(self, user_pk: int, limit: int = 5):
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT id, topic_text, created_at FROM posts"
+            " WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_pk, limit),
+        ) as cur:
+            return await cur.fetchall()
+
+    async def get_post_by_id(self, post_pk: int, user_pk: int):
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT post_text FROM posts WHERE id = ? AND user_id = ?",
+            (post_pk, user_pk),
+        ) as cur:
+            return await cur.fetchone()
+
+    async def upsert_channel(self, chat_id: int, title: str | None) -> None:
+        assert self._conn is not None
+        await self._conn.execute(
+            "INSERT INTO channels (chat_id, title, created_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(chat_id) DO UPDATE SET"
+            " title = excluded.title, active = 1",
+            (chat_id, title or "", _now_iso()),
+        )
+        await self._conn.commit()
+
+    async def set_channel_inactive(self, chat_id: int) -> None:
+        assert self._conn is not None
+        await self._conn.execute(
+            "UPDATE channels SET active = 0, bound = 0 WHERE chat_id = ?",
+            (chat_id,),
+        )
+        await self._conn.commit()
+
+    async def list_channels(self):
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT * FROM channels WHERE active = 1 ORDER BY id"
+        ) as cur:
+            return await cur.fetchall()
+
+    async def bind_channel(self, chat_id: int) -> None:
+        assert self._conn is not None
+        await self._conn.execute("UPDATE channels SET bound = 0")
+        await self._conn.execute(
+            "UPDATE channels SET bound = 1 WHERE chat_id = ?", (chat_id,)
+        )
+        await self._conn.commit()
+
+    async def unbind_channels(self) -> None:
+        assert self._conn is not None
+        await self._conn.execute("UPDATE channels SET bound = 0")
+        await self._conn.commit()
+
+    async def get_bound_channel(self):
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT * FROM channels WHERE bound = 1 AND active = 1 LIMIT 1"
+        ) as cur:
+            return await cur.fetchone()
 
     async def get_stats(self) -> list[aiosqlite.Row]:
         assert self._conn is not None

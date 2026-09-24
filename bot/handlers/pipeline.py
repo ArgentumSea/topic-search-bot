@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from aiogram.fsm.context import FSMContext
@@ -7,7 +8,11 @@ from aiogram.types import (
     Message,
 )
 
+from bot.services.query_expand import expand_query
 from bot.config import settings
+from bot.handlers.post_actions import PostActions
+from bot.quota import tavily_exhausted
+from bot.services.posting import _sources_relevant
 from bot.db import Database
 from bot.handlers.common import (
     SearchStates,
@@ -50,15 +55,23 @@ async def run_search_pipeline(
     if not await _check_quota(message, state, db, db_user):
         return
     status = await message.answer("Ищу информацию…")
+    query = await expand_query(llm, query)
     try:
-        results = await search.search(query, settings.TAVILY_MAX_RESULTS)
-        prompt = load_prompt("topics").format(
-            query=query, sources=_format_sources(results)
+        if await tavily_exhausted(message.bot, db):
+            results = []
+        else:
+            results = await search.search(query, settings.TAVILY_MAX_RESULTS)
+            await db.add_tavily_spend(settings.TAVILY_CREDITS_PER_REQUEST)
+        src = (
+            _format_sources(results)
+            if results
+            else "(поиск в сети недоступен — опирайся на свои знания)"
         )
+        prompt = load_prompt("topics").format(query=query, sources=src)
         topics = _parse_topics(await llm.generate(prompt))
     except QuotaExhaustedError:
         await _safe_delete(status)
-        await message.answer("Лимит API иссяк — попробуйте позже")
+        await message.answer("Все модели временно недоступны: квота дня или перегрузка. Попробуйте через 10-15 минут.")
         await state.clear()
         return
     except (SearchError, LLMError) as exc:
@@ -106,20 +119,49 @@ async def run_topic_pipeline(
     if not await _check_quota(message, state, db, db_user):
         return
     status = await message.answer("Анализирую тему…")
+    query = await expand_query(llm, query)
     try:
-        results = await search.search(query, settings.TAVILY_MAX_RESULTS)
-        post = await _generate_post(llm, query, query, results)
+        if await tavily_exhausted(message.bot, db):
+            results = []
+        else:
+            results = await search.search(query, settings.TAVILY_MAX_RESULTS)
+            await db.add_tavily_spend(settings.TAVILY_CREDITS_PER_REQUEST)
+        _guard_ok = True
+        if results:
+            _guard_ok, post = await asyncio.gather(
+                _sources_relevant(llm, query, results),
+                _generate_post(llm, query, query, results),
+            )
+        else:
+            post = await _generate_post(llm, query, query, results)
+        if results and not _guard_ok:
+            await _safe_delete(status)
+            await message.answer(
+                "По запросу не нашлось релевантных источников — пост"
+                " получился бы некачественным. Попробуй переформулировать."
+            )
+            return
     except (SearchError, LLMError) as exc:
         await _safe_delete(status)
         await _report_error(message, exc)
         return
 
     await _safe_delete(status)
-    await _deliver_post(message, post, [r.url for r in results])
+    texts = await _deliver_post(message, post, results)
+    await state.update_data(
+        query=query,
+        topic=query,
+        sources=[
+            {"title": r.title, "url": r.url, "content": r.content}
+            for r in results
+        ],
+        post_texts=texts,
+    )
+    await state.set_state(PostActions.ready)
     if db_user is not None:
         await db.log_request(db_user["id"], "topic", query)
         await db.save_post(
             db_user["id"], query,
             "\n\n---\n\n".join(post["posts"]),
-            post["media_suggestion"] or None,
+            (post.get("media_suggestions") or [None])[0],
         )

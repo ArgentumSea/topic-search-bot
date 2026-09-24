@@ -24,11 +24,12 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 @router.message(Command("search"))
 async def cmd_search(message: Message, state: FSMContext) -> None:
     await state.set_state(SearchStates.waiting_query)
+    await state.update_data(since=message.date.timestamp())
     await message.answer("На какую тему искать информацию?")
 
 
 @router.message(
-    SearchStates.waiting_query, F.text.func(lambda t: not t.startswith("/"))
+    SearchStates.waiting_query, F.text.func(lambda t: bool(t) and not t.startswith("/"))
 )
 async def process_query(
     message: Message,
@@ -38,19 +39,10 @@ async def process_query(
     db: Database,
     db_user,
 ) -> None:
+    _guard = (await state.get_data()).get("since")
+    if _guard and message.date.timestamp() < _guard:
+        return
     query = message.text.strip()
     await run_search_pipeline(message, state, query, search, llm, db, db_user)
 
 
-@router.message(StateFilter(None), F.text.func(lambda t: not t.startswith("/")))
-async def free_text_search(
-    message: Message,
-    state: FSMContext,
-    search: SearchProvider,
-    llm: LLMProvider,
-    db: Database,
-    db_user,
-) -> None:
-    """Свободный текст без команды = запрос на поиск (сценарий из ТЗ)."""
-    query = message.text.strip()
-    await run_search_pipeline(message, state, query, search, llm, db, db_user)

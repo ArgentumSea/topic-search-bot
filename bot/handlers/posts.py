@@ -8,7 +8,10 @@ from aiogram.types import CallbackQuery, Message
 
 from bot.config import settings
 from bot.db import Database
+from bot.quota import tavily_exhausted
+from bot.services.posting import _sources_relevant
 from bot.handlers.common import SearchStates, _report_error, _safe_delete
+from bot.handlers.post_actions import PostActions
 from bot.handlers.pipeline import run_topic_pipeline
 from bot.services.llm import LLMError, LLMProvider
 from bot.services.posting import _deliver_post, _generate_post
@@ -25,13 +28,14 @@ class TopicStates(StatesGroup):
 @router.message(Command("topic"))
 async def cmd_topic(message: Message, state: FSMContext) -> None:
     await state.set_state(TopicStates.waiting_topic)
+    await state.update_data(since=message.date.timestamp())
     await message.answer(
         "Напиши тему поста — я изучу информацию и подготовлю пост."
     )
 
 
 @router.message(
-    TopicStates.waiting_topic, F.text.func(lambda t: not t.startswith("/"))
+    TopicStates.waiting_topic, F.text.func(lambda t: bool(t) and not t.startswith("/"))
 )
 async def process_topic(
     message: Message,
@@ -41,12 +45,16 @@ async def process_topic(
     db: Database,
     db_user,
 ) -> None:
+    _guard = (await state.get_data()).get("since")
+    if _guard and message.date.timestamp() < _guard:
+        return
     query = message.text.strip()
     await run_topic_pipeline(message, state, query, search, llm, db, db_user)
 
 
 @router.callback_query(
-    SearchStates.choosing_topic, F.data.startswith("topic:")
+    StateFilter(SearchStates.choosing_topic, PostActions.ready),
+    F.data.startswith("topic:"),
 )
 async def choose_topic(
     callback: CallbackQuery,
@@ -71,24 +79,37 @@ async def choose_topic(
     await callback.answer()
     query = data.get("query", "")
     topic = topics[idx]
-    await state.clear()
 
     status = await callback.message.answer("Анализирую тему…")
     try:
-        results = await search.search(
-            topic["title"], settings.TAVILY_MAX_RESULTS
-        )
+        if await tavily_exhausted(callback.message.bot, db):
+            results = []
+        else:
+            results = await search.search(
+                f"{query} {topic['title']}", settings.TAVILY_MAX_RESULTS
+            )
+            await db.add_tavily_spend(settings.TAVILY_CREDITS_PER_REQUEST)
         post = await _generate_post(llm, query, topic["title"], results)
     except (SearchError, LLMError) as exc:
         await _safe_delete(status)
         await _report_error(callback.message, exc)
         return
     await _safe_delete(status)
-    await _deliver_post(callback.message, post, [r.url for r in results])
+    texts = await _deliver_post(callback.message, post, results)
+    await state.update_data(
+        query=query,
+        topic=topic["title"],
+        sources=[
+            {"title": r.title, "url": r.url, "content": r.content}
+            for r in results
+        ],
+        post_texts=texts,
+    )
+    await state.set_state(PostActions.ready)
     if db_user is not None:
         await db.log_request(db_user["id"], "search", query)
         await db.save_post(
             db_user["id"], topic["title"],
             "\n\n---\n\n".join(post["posts"]),
-            post["media_suggestion"] or None,
+            (post.get("media_suggestions") or [None])[0],
         )

@@ -14,6 +14,8 @@ from bot.config import settings
 from bot.db import Database
 from bot.handlers import admin as admin_handlers
 from bot.handlers import files as files_handlers
+from bot.handlers import channels as channels_handlers
+from bot.handlers import post_actions as post_actions_handlers
 from bot.handlers import posts as posts_handlers
 from bot.handlers import search as search_handlers
 from bot.handlers import start as start_handlers
@@ -24,6 +26,16 @@ from bot.services.search import TavilyProvider
 from bot.services.voice import VoiceTranscriber
 
 log = logging.getLogger(__name__)
+
+
+async def _cleanup_loop(db: Database) -> None:
+    while True:
+        await asyncio.sleep(86400)
+        try:
+            removed = await db.cleanup_old_logs()
+            log.info("db cleanup done", extra={"removed": removed})
+        except Exception:  # noqa: BLE001
+            log.exception("db cleanup failed")
 
 
 async def healthcheck(request: web.Request) -> web.Response:
@@ -45,13 +57,16 @@ async def main() -> None:
         search_depth=settings.TAVILY_SEARCH_DEPTH,
     )
     dp["llm"] = GeminiProvider(
-        api_key=settings.GEMINI_API_KEY, models=settings.LLM_MODELS
+        api_key=settings.GEMINI_API_KEY,
+        api_keys=[k for k in (settings.GEMINI_API_KEY, settings.GEMINI_API_KEY_2) if k], models=settings.LLM_MODELS,
     )
     dp["transcriber"] = VoiceTranscriber(settings.VOSK_MODEL_PATH)
 
     dp.include_router(start_handlers.router)
     dp.include_router(search_handlers.router)
     dp.include_router(posts_handlers.router)
+    dp.include_router(post_actions_handlers.router)
+    dp.include_router(channels_handlers.router)
     dp.include_router(files_handlers.router)
     dp.include_router(admin_handlers.router)
     dp.message.middleware(AccessMiddleware(db))
@@ -64,6 +79,10 @@ async def main() -> None:
             BotCommand(command="search", description="Подборка тем по запросу"),
             BotCommand(command="topic", description="Пост по готовой теме"),
             BotCommand(command="cancel", description="Прервать действие"),
+            BotCommand(command="admin", description="Управление пользователями (админ)"),
+            BotCommand(command="stat", description="Статистика запросов (админ)"),
+            BotCommand(command="last", description="Мои последние посты"),
+            BotCommand(command="channel", description="Каналы публикации (админ)"),
         ]
     )
 
@@ -92,8 +111,9 @@ async def main() -> None:
             )
             await asyncio.Event().wait()
         else:
+            asyncio.create_task(_cleanup_loop(db))
             log.info("starting polling")
-            await dp.start_polling(bot)
+            await dp.start_polling(bot, drop_pending_updates=True)
     finally:
         log.info("shutting down")
         if settings.USE_WEBHOOK:

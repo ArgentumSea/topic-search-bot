@@ -91,7 +91,7 @@ async def _extract_query(
         F.voice | F.audio | F.photo | F.video
         | F.video_note | F.document
     ),
-    StateFilter(None, SearchStates.waiting_query),
+    SearchStates.waiting_query,
 )
 async def file_as_search(
     message: Message,
@@ -102,6 +102,9 @@ async def file_as_search(
     db_user,
     transcriber: VoiceTranscriber,
 ) -> None:
+    _guard = (await state.get_data()).get("since")
+    if _guard and message.date.timestamp() < _guard:
+        return
     query = await _extract_query(message, llm, transcriber)
     if not query and message.caption:
         query = message.caption.strip()
@@ -129,6 +132,9 @@ async def file_as_topic(
     db_user,
     transcriber: VoiceTranscriber,
 ) -> None:
+    _guard = (await state.get_data()).get("since")
+    if _guard and message.date.timestamp() < _guard:
+        return
     query = await _extract_query(message, llm, transcriber)
     if not query and message.caption:
         query = message.caption.strip()

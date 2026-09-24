@@ -2,7 +2,7 @@ import logging
 
 from aiogram import Bot, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
 from bot.config import settings
 from bot.db import Database
@@ -11,18 +11,28 @@ log = logging.getLogger(__name__)
 router = Router()
 
 HELP_TEXT = (
-    "Я бот для поиска актуальной информации в сети "
-    "и создания постов для твоего блога в Telegram.\n\n"
-    "Отправь мне описание темы или файл (фото, видео, аудио, документ) — "
-    "я проанализирую и сделаю подборку тем. Когда выберешь тему, "
-    "я напишу для тебя пост.\n"
-    "Если у тебя уже есть готовая тема, используй /topic.\n\n"
-    "Команды:\n"
-    "/search — подборка актуальных тем по запросу\n"
-    "/topic — пост по готовой теме\n"
-    "/cancel — прервать текущее действие\n"
-    "/help — эта справка"
+    "Я бот для поиска актуальной информации в сети и создания постов "
+    "для твоего блога в Telegram.\n\n"
+    "/search — отправь мне описание темы или файл (фото, видео, аудио, "
+    "документ) — я проанализирую и сделаю подборку тем. Когда выберешь "
+    "тему, я напишу для тебя пост.\n"
+    "/topic — пост по готовой теме.\n"
+    "/last — последние посты\n"
+    "/cancel — прервать текущее действие"
 )
+
+
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    """Панель команд под строкой ввода."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="/search"), KeyboardButton(text="/topic")],
+            [KeyboardButton(text="/last"), KeyboardButton(text="/channel")],
+            [KeyboardButton(text="/stat"), KeyboardButton(text="/admin")],
+            [KeyboardButton(text="/help"), KeyboardButton(text="/cancel")],
+        ],
+        resize_keyboard=True,
+    )
 
 
 @router.message(CommandStart())
@@ -56,7 +66,8 @@ async def cmd_start(message: Message, db: Database, bot: Bot) -> None:
         "я напишу для тебя пост.\n"
         "Если у тебя уже есть готовая тема, напиши мне — я изучу информацию "
         "и подготовлю пост.\n\n"
-        "Подробности: /help"
+        "Подробности: /help",
+        reply_markup=main_menu_kb(),
     )
 
 
