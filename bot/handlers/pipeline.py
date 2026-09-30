@@ -8,7 +8,7 @@ from aiogram.types import (
     Message,
 )
 
-from bot.services.query_expand import expand_query
+from bot.services.query_expand import expand_query, refine_query
 from bot.config import settings
 from bot.handlers.post_actions import PostActions
 from bot.quota import tavily_exhausted
@@ -55,6 +55,7 @@ async def run_search_pipeline(
     if not await _check_quota(message, state, db, db_user):
         return
     status = await message.answer("Ищу информацию…")
+    query = await refine_query(llm, query)
     query = await expand_query(llm, query)
     try:
         if await tavily_exhausted(message.bot, db):
@@ -119,6 +120,7 @@ async def run_topic_pipeline(
     if not await _check_quota(message, state, db, db_user):
         return
     status = await message.answer("Анализирую тему…")
+    query = await refine_query(llm, query)
     query = await expand_query(llm, query)
     try:
         if await tavily_exhausted(message.bot, db):

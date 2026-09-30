@@ -58,6 +58,7 @@ def _parse_post(raw: str) -> dict:
         unwrapped.append(_p)
     posts = [x for x in unwrapped if x.strip()]
     posts = [x.replace(chr(92) + "n", chr(10)).replace(chr(13) + chr(10), chr(10)).strip() for x in posts]
+    posts = [__import__("re").sub(r"(?<!\n)\n(?!\n)", "\n\n", p) for p in posts]
     if not posts:
         raise LLMError("пост не получен")
     medias = [str(m).strip() for m in (data.get("media_suggestions") or [])]

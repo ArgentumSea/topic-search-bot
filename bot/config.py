@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     TAVILY_MIN_SCORE: float = 0.4
     TAVILY_TOPIC: str = "auto"
     TAVILY_CREDITS_PER_REQUEST: int = 2
-    TAVILY_RESET_DAY: int = 19
+    TAVILY_RESET_DAY: int = 1
     TAVILY_INITIAL_CREDITS: int = 20
 
     DATABASE_PATH: str = "/data/topic_search.db"
